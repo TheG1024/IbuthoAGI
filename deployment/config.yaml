@@ -1,0 +1,150 @@
+# IbuthoAGI Deployment Configuration
+
+# Environment Configuration
+environment:
+  name: production
+  python_version: "3.8"
+  debug: false
+  log_level: INFO
+
+# API Configuration
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  timeout: 300
+  rate_limit: 100
+  cors_origins: ["*"]
+
+# Agent Configuration
+agents:
+  coordinator:
+    max_concurrent_tasks: 10
+    task_timeout: 600
+    memory_limit: 1000
+  
+  researcher:
+    max_concurrent_searches: 5
+    search_timeout: 300
+    cache_size: 1000
+  
+  planner:
+    max_plan_depth: 10
+    planning_timeout: 300
+    max_iterations: 5
+  
+  executor:
+    max_concurrent_executions: 8
+    execution_timeout: 900
+    retry_attempts: 3
+  
+  critic:
+    evaluation_timeout: 300
+    metrics_history_size: 1000
+  
+  innovator:
+    max_iterations: 5
+    innovation_timeout: 300
+    idea_cache_size: 1000
+  
+  code_agent:
+    max_code_size: 10000
+    analysis_timeout: 300
+    generation_timeout: 600
+    optimization_timeout: 300
+  
+  data_science_agent:
+    max_data_size: 1000000
+    training_timeout: 3600
+    prediction_timeout: 300
+    model_cache_size: 5
+  
+  nlp_agent:
+    max_text_length: 10000
+    analysis_timeout: 300
+    generation_timeout: 300
+    embedding_batch_size: 32
+
+# Memory Management
+memory:
+  vector_store: faiss
+  max_memory_size: 10000
+  cleanup_interval: 3600
+  ttl: 86400  # 24 hours
+
+# Model Configuration
+models:
+  llm:
+    provider: openai
+    model: gpt-4
+    temperature: 0.7
+    max_tokens: 2000
+    request_timeout: 60
+  
+  embeddings:
+    provider: openai
+    model: text-embedding-ada-002
+    batch_size: 32
+  
+  spacy:
+    model: en_core_web_sm
+  
+  transformers:
+    max_length: 512
+    device: cuda  # or cpu
+
+# Monitoring
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  
+  logging:
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    file: logs/ibutho.log
+    max_size: 100MB
+    backup_count: 5
+  
+  tracing:
+    enabled: true
+    exporter: jaeger
+    host: localhost
+    port: 6831
+
+# Security
+security:
+  api_key_header: X-API-Key
+  rate_limiting: true
+  cors_enabled: true
+  ssl_enabled: true
+  ssl_cert: certs/cert.pem
+  ssl_key: certs/key.pem
+
+# Storage
+storage:
+  type: filesystem  # or s3, gcs
+  models_dir: models
+  data_dir: data
+  temp_dir: /tmp/ibutho
+
+# Cache
+cache:
+  type: redis
+  host: localhost
+  port: 6379
+  db: 0
+  ttl: 3600
+
+# Error Handling
+error_handling:
+  max_retries: 3
+  retry_delay: 5
+  fallback_enabled: true
+  error_reporting: true
+
+# Resource Limits
+resources:
+  cpu_limit: 8
+  memory_limit: 16GB
+  gpu_enabled: true
+  max_parallel_tasks: 10

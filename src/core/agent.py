@@ -1,19 +1,35 @@
 """
 Core agent implementation for IbuthoAGI.
 """
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 import uuid
 import json
 from enum import Enum
 import logging
+import asyncio
 from pydantic import BaseModel
 
 from langchain.llms import OpenAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
+
+from .communication import (
+    CommunicationType,
+    CommunicationProtocol,
+    RoutingInfo,
+    CommunicationChannel,
+    CommunicationManager
+)
+
+from .message import Message, MessagePriority
+from .message_processing import (
+    MessageProcessor,
+    MessageValidationError,
+    MessageTransformationError
+)
 
 class AgentRole(str, Enum):
     """Predefined agent roles."""
@@ -43,18 +59,6 @@ class AgentState:
     context: Dict[str, Any] = field(default_factory=dict)
     performance_metrics: Dict[str, float] = field(default_factory=dict)
 
-class Message(BaseModel):
-    """Message format for agent communication."""
-    id: str
-    sender: str
-    receiver: str
-    content: Dict[str, Any]
-    type: str
-    timestamp: datetime
-    priority: int = 1
-    requires_response: bool = False
-    context: Dict[str, Any] = {}
-
 class Agent:
     """Base agent class with core functionality."""
     
@@ -63,6 +67,7 @@ class Agent:
         agent_id: str,
         role: AgentRole,
         capabilities: List[AgentCapability],
+        comm_manager: Optional[CommunicationManager] = None,
         llm: Optional[OpenAI] = None,
         memory_size: int = 1000
     ):
@@ -79,6 +84,11 @@ class Agent:
             max_tokens=memory_size
         )
         
+        # Initialize communication
+        self.comm_manager = comm_manager or CommunicationManager()
+        self.subscribed_channels: Dict[str, CommunicationChannel] = {}
+        self.default_protocol = CommunicationProtocol.ASYNCHRONOUS
+        
         # Message handlers
         self.message_handlers: Dict[str, Callable] = {}
         self._register_default_handlers()
@@ -88,11 +98,16 @@ class Agent:
             "tasks_completed": 0,
             "success_rate": 1.0,
             "average_response_time": 0.0,
-            "error_rate": 0.0
+            "error_rate": 0.0,
+            "messages_processed": 0,
+            "messages_sent": 0
         }
         
         # Initialize logger
         self.logger = logging.getLogger(f"agent.{agent_id}")
+        
+        # Initialize message processor
+        self.message_processor = MessageProcessor()
     
     def _register_default_handlers(self) -> None:
         """Register default message handlers."""
@@ -106,6 +121,7 @@ class Agent:
     async def process_message(self, message: Message) -> Optional[Message]:
         """Process incoming message."""
         try:
+            self.performance_metrics["messages_processed"] += 1
             handler = self.message_handlers.get(message.type)
             if handler:
                 start_time = datetime.now()
@@ -120,6 +136,99 @@ class Agent:
             self._update_error_rate()
             return self._create_error_message(str(e), message.sender)
     
+    async def send_message(
+        self,
+        receiver: Union[str, List[str]],
+        content: Dict[str, Any],
+        msg_type: str,
+        route_type: CommunicationType = CommunicationType.DIRECT,
+        protocol: Optional[CommunicationProtocol] = None,
+        priority: int = MessagePriority.MEDIUM,
+        requires_response: bool = False
+    ) -> None:
+        """Send a message through the communication manager."""
+        try:
+            message = Message(
+                id=str(uuid.uuid4()),
+                sender=self.agent_id,
+                receiver=receiver if isinstance(receiver, str) else receiver[0],
+                content=content,
+                type=msg_type,
+                timestamp=datetime.now(),
+                priority=priority,
+                requires_response=requires_response
+            )
+            
+            # Process outgoing message
+            processed_message = await self.message_processor.process_outgoing(message)
+            
+            routing_info = RoutingInfo(
+                source=self.agent_id,
+                destination=receiver,
+                route_type=route_type,
+                protocol=protocol or self.default_protocol
+            )
+            
+            await self.comm_manager.route_message(processed_message, routing_info)
+            self.performance_metrics["messages_sent"] += 1
+            
+        except (MessageValidationError, MessageTransformationError) as e:
+            self.logger.error(f"Error sending message: {str(e)}")
+            self._update_error_rate()
+    
+    async def subscribe_to_channel(self, channel_id: str) -> None:
+        """Subscribe to a communication channel."""
+        try:
+            if channel_id not in self.subscribed_channels:
+                channel = self.comm_manager.create_channel(channel_id)
+                await channel.subscribe(self)
+                self.subscribed_channels[channel_id] = channel
+                self.logger.info(f"Subscribed to channel: {channel_id}")
+        except Exception as e:
+            self.logger.error(f"Error subscribing to channel: {str(e)}")
+
+    async def unsubscribe_from_channel(self, channel_id: str) -> None:
+        """Unsubscribe from a communication channel."""
+        try:
+            if channel_id in self.subscribed_channels:
+                await self.subscribed_channels[channel_id].unsubscribe(self.agent_id)
+                del self.subscribed_channels[channel_id]
+                self.logger.info(f"Unsubscribed from channel: {channel_id}")
+        except Exception as e:
+            self.logger.error(f"Error unsubscribing from channel: {str(e)}")
+
+    async def broadcast_to_role(
+        self,
+        role: AgentRole,
+        content: Dict[str, Any],
+        msg_type: str,
+        priority: int = MessagePriority.MEDIUM
+    ) -> None:
+        """Broadcast a message to all agents with a specific role."""
+        await self.send_message(
+            f"role_{role}",
+            content,
+            msg_type,
+            route_type=CommunicationType.BROADCAST,
+            priority=priority
+        )
+
+    async def publish_to_topic(
+        self,
+        topic: str,
+        content: Dict[str, Any],
+        msg_type: str,
+        priority: int = MessagePriority.MEDIUM
+    ) -> None:
+        """Publish a message to a topic."""
+        await self.send_message(
+            f"topic_{topic}",
+            content,
+            msg_type,
+            route_type=CommunicationType.PUBLISH_SUBSCRIBE,
+            priority=priority
+        )
+
     async def _handle_task_request(self, message: Message) -> Message:
         """Handle task request messages."""
         if self.state.busy:

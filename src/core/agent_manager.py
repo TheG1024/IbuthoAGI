@@ -1,210 +1,234 @@
 """
-Agent manager for orchestrating multiple agents.
+Agent management system for IbuthoAGI.
 """
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 import asyncio
-from datetime import datetime
 import logging
-from uuid import uuid4
+from datetime import datetime
+import uuid
 
 from .agent import Agent, AgentRole, AgentCapability, Message
+from .communication import (
+    CommunicationType,
+    CommunicationProtocol,
+    MessagePriority,
+    RoutingInfo,
+    CommunicationManager
+)
 
 class AgentManager:
-    """Manages a group of agents and their interactions."""
+    """Manages agent lifecycle and communication."""
     
     def __init__(self):
         self.agents: Dict[str, Agent] = {}
-        self.message_queue: asyncio.Queue[Message] = asyncio.Queue()
+        self.role_groups: Dict[AgentRole, List[str]] = {role: [] for role in AgentRole}
+        self.comm_manager = CommunicationManager()
         self.logger = logging.getLogger("agent_manager")
-        self.active_tasks: Dict[str, Dict[str, Any]] = {}
+        
+        # Start communication processing
+        self.processing = False
+        self.process_task: Optional[asyncio.Task] = None
     
-    def register_agent(self, agent: Agent) -> None:
+    async def start(self) -> None:
+        """Start the agent manager."""
+        if not self.processing:
+            self.processing = True
+            self.process_task = asyncio.create_task(self.comm_manager.start())
+            self.logger.info("Agent manager started")
+    
+    async def stop(self) -> None:
+        """Stop the agent manager."""
+        if self.processing:
+            self.processing = False
+            if self.process_task:
+                self.process_task.cancel()
+                try:
+                    await self.process_task
+                except asyncio.CancelledError:
+                    pass
+            await self.comm_manager.stop()
+            self.logger.info("Agent manager stopped")
+    
+    def register_agent(
+        self,
+        agent_id: str,
+        role: AgentRole,
+        capabilities: List[AgentCapability]
+    ) -> Agent:
         """Register a new agent."""
-        if agent.agent_id in self.agents:
-            raise ValueError(f"Agent {agent.agent_id} already registered")
-        self.agents[agent.agent_id] = agent
-        self.logger.info(f"Registered agent: {agent.agent_id} ({agent.role})")
+        if agent_id in self.agents:
+            raise ValueError(f"Agent {agent_id} already registered")
+        
+        agent = Agent(
+            agent_id=agent_id,
+            role=role,
+            capabilities=capabilities,
+            comm_manager=self.comm_manager
+        )
+        
+        self.agents[agent_id] = agent
+        self.role_groups[role].append(agent_id)
+        
+        # Subscribe to role-specific channel
+        asyncio.create_task(
+            agent.subscribe_to_channel(f"role_{role}")
+        )
+        
+        self.logger.info(f"Registered agent {agent_id} with role {role}")
+        return agent
     
     def unregister_agent(self, agent_id: str) -> None:
         """Unregister an agent."""
         if agent_id in self.agents:
+            agent = self.agents[agent_id]
+            
+            # Unsubscribe from role-specific channel
+            asyncio.create_task(
+                agent.unsubscribe_from_channel(f"role_{agent.role}")
+            )
+            
+            # Remove from role group
+            self.role_groups[agent.role].remove(agent_id)
+            
+            # Remove agent
             del self.agents[agent_id]
-            self.logger.info(f"Unregistered agent: {agent_id}")
-    
-    async def start(self) -> None:
-        """Start the agent manager."""
-        self.logger.info("Starting agent manager")
-        await self._process_message_queue()
-    
-    async def stop(self) -> None:
-        """Stop the agent manager."""
-        self.logger.info("Stopping agent manager")
-        # Implement cleanup logic
+            
+            self.logger.info(f"Unregistered agent {agent_id}")
     
     async def submit_task(
         self,
-        task: Dict[str, Any],
-        priority: int = 1
+        task_content: Dict[str, Any],
+        target_role: Optional[AgentRole] = None,
+        target_agent: Optional[str] = None,
+        priority: int = MessagePriority.MEDIUM
     ) -> str:
-        """Submit a new task to the system."""
-        task_id = str(uuid4())
-        coordinator = self._get_coordinator()
+        """Submit a task to agents."""
+        task_id = str(uuid.uuid4())
+        task_content["task_id"] = task_id
         
-        if not coordinator:
-            raise RuntimeError("No coordinator agent available")
+        if target_agent:
+            # Direct task to specific agent
+            if target_agent not in self.agents:
+                raise ValueError(f"Agent {target_agent} not found")
+            
+            await self.agents[target_agent].send_message(
+                target_agent,
+                task_content,
+                "task_request",
+                priority=priority,
+                requires_response=True
+            )
+            
+        elif target_role:
+            # Broadcast task to role
+            if not self.role_groups[target_role]:
+                raise ValueError(f"No agents found for role {target_role}")
+            
+            await self._broadcast_to_role(
+                target_role,
+                task_content,
+                "task_request",
+                priority=priority
+            )
+            
+        else:
+            # Find suitable agent based on task requirements
+            coordinator = self._get_coordinator()
+            if not coordinator:
+                raise ValueError("No coordinator agent available")
+            
+            await coordinator.send_message(
+                coordinator.agent_id,
+                task_content,
+                "task_request",
+                priority=priority,
+                requires_response=True
+            )
         
-        message = Message(
-            id=str(uuid4()),
-            sender="system",
-            receiver=coordinator.agent_id,
-            content={
-                "task_id": task_id,
-                "task": task
-            },
-            type="task_request",
-            timestamp=datetime.now(),
-            priority=priority
-        )
-        
-        self.active_tasks[task_id] = {
-            "status": "submitted",
-            "task": task,
-            "coordinator": coordinator.agent_id,
-            "start_time": datetime.now(),
-            "priority": priority
-        }
-        
-        await self.message_queue.put(message)
+        self.logger.info(f"Submitted task {task_id}")
         return task_id
-    
-    async def get_task_status(self, task_id: str) -> Dict[str, Any]:
-        """Get the status of a task."""
-        if task_id not in self.active_tasks:
-            raise ValueError(f"Task {task_id} not found")
-        return self.active_tasks[task_id]
-    
-    def get_available_agents(
-        self,
-        role: Optional[AgentRole] = None,
-        capability: Optional[AgentCapability] = None
-    ) -> List[Agent]:
-        """Get available agents matching criteria."""
-        available_agents = []
-        
-        for agent in self.agents.values():
-            if agent.state.busy:
-                continue
-            
-            if role and agent.role != role:
-                continue
-            
-            if capability and capability not in agent.capabilities:
-                continue
-            
-            available_agents.append(agent)
-        
-        return available_agents
     
     async def broadcast_message(
         self,
         content: Dict[str, Any],
         msg_type: str,
-        priority: int = 1,
-        role: Optional[AgentRole] = None
+        target_role: Optional[AgentRole] = None,
+        priority: int = MessagePriority.MEDIUM
     ) -> None:
-        """Broadcast a message to all agents or agents with specific role."""
-        for agent in self.agents.values():
-            if role and agent.role != role:
-                continue
-            
-            message = Message(
-                id=str(uuid4()),
-                sender="system",
-                receiver=agent.agent_id,
-                content=content,
-                type=msg_type,
-                timestamp=datetime.now(),
-                priority=priority
-            )
-            
-            await self.message_queue.put(message)
+        """Broadcast a message to all agents or agents with a specific role."""
+        if target_role:
+            await self._broadcast_to_role(target_role, content, msg_type, priority)
+        else:
+            for agent in self.agents.values():
+                await agent.send_message(
+                    "all",
+                    content,
+                    msg_type,
+                    route_type=CommunicationType.BROADCAST,
+                    priority=priority
+                )
     
-    async def _process_message_queue(self) -> None:
-        """Process messages in the queue."""
-        while True:
-            try:
-                message = await self.message_queue.get()
-                await self._route_message(message)
-                self.message_queue.task_done()
-            except Exception as e:
-                self.logger.error(f"Error processing message: {str(e)}")
-    
-    async def _route_message(self, message: Message) -> None:
-        """Route message to appropriate agent."""
-        receiver = self.agents.get(message.receiver)
-        if not receiver:
-            self.logger.warning(f"Unknown receiver: {message.receiver}")
-            return
-        
-        try:
-            response = await receiver.process_message(message)
-            if response:
-                await self.message_queue.put(response)
-        except Exception as e:
-            self.logger.error(f"Error routing message: {str(e)}")
-            # Create error response
-            error_message = Message(
-                id=str(uuid4()),
-                sender="system",
-                receiver=message.sender,
-                content={"error": str(e)},
-                type="error_response",
-                timestamp=datetime.now(),
-                priority=3
-            )
-            await self.message_queue.put(error_message)
-    
-    def _get_coordinator(self) -> Optional[Agent]:
-        """Get an available coordinator agent."""
-        for agent in self.agents.values():
-            if (
-                agent.role == AgentRole.COORDINATOR
-                and not agent.state.busy
-            ):
-                return agent
-        return None
-    
-    async def _update_task_status(
+    async def get_agent_status(
         self,
-        task_id: str,
-        status: str,
-        result: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Update task status."""
-        if task_id in self.active_tasks:
-            self.active_tasks[task_id].update({
-                "status": status,
-                "last_updated": datetime.now(),
-                "result": result
-            })
-            
-            if status in ["completed", "failed"]:
-                self.active_tasks[task_id]["end_time"] = datetime.now()
-    
-    def get_system_metrics(self) -> Dict[str, Any]:
-        """Get system-wide performance metrics."""
-        metrics = {
-            "active_agents": len(self.agents),
-            "active_tasks": len(self.active_tasks),
-            "message_queue_size": self.message_queue.qsize(),
-            "agent_metrics": {}
-        }
+        agent_id: Optional[str] = None,
+        role: Optional[AgentRole] = None
+    ) -> Dict[str, Any]:
+        """Get status of agents."""
+        status = {}
         
-        for agent_id, agent in self.agents.items():
-            metrics["agent_metrics"][agent_id] = {
+        if agent_id:
+            if agent_id not in self.agents:
+                raise ValueError(f"Agent {agent_id} not found")
+            agent = self.agents[agent_id]
+            status[agent_id] = {
                 "role": agent.role,
-                "busy": agent.state.busy,
+                "capabilities": agent.capabilities,
+                "state": agent.state.__dict__,
                 "metrics": agent.performance_metrics
             }
+            
+        elif role:
+            for agent_id in self.role_groups[role]:
+                agent = self.agents[agent_id]
+                status[agent_id] = {
+                    "role": agent.role,
+                    "capabilities": agent.capabilities,
+                    "state": agent.state.__dict__,
+                    "metrics": agent.performance_metrics
+                }
+                
+        else:
+            for agent_id, agent in self.agents.items():
+                status[agent_id] = {
+                    "role": agent.role,
+                    "capabilities": agent.capabilities,
+                    "state": agent.state.__dict__,
+                    "metrics": agent.performance_metrics
+                }
         
-        return metrics
+        return status
+    
+    def _get_coordinator(self) -> Optional[Agent]:
+        """Get the first available coordinator agent."""
+        coordinator_ids = self.role_groups[AgentRole.COORDINATOR]
+        return self.agents[coordinator_ids[0]] if coordinator_ids else None
+    
+    async def _broadcast_to_role(
+        self,
+        role: AgentRole,
+        content: Dict[str, Any],
+        msg_type: str,
+        priority: int = MessagePriority.MEDIUM
+    ) -> None:
+        """Broadcast a message to all agents with a specific role."""
+        if not self.role_groups[role]:
+            raise ValueError(f"No agents found for role {role}")
+        
+        for agent_id in self.role_groups[role]:
+            await self.agents[agent_id].send_message(
+                agent_id,
+                content,
+                msg_type,
+                route_type=CommunicationType.BROADCAST,
+                priority=priority
+            )
